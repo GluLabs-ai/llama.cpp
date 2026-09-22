@@ -948,8 +948,6 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_FFN_UP_CHEXPS,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
     {LLM_TENSOR_FFN_EXP_PROBS_B,            {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
     {LLM_TENSOR_FFN_EXP_PROBS_B_VL,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
-     { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL }                                              }, // do the norms on the first layer (not the input layer)
-     { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL }                                              }, // a version of SSM_A used for MUL instead of SSM_SCAN
     // altup / laurel (gemma 3n)
     { LLM_TENSOR_PER_LAYER_TOKEN_EMBD,     { LLM_TENSOR_LAYER_INPUT, GGML_OP_GET_ROWS }       },
     { LLM_TENSOR_PER_LAYER_MODEL_PROJ,     { LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT }    },

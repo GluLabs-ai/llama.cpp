@@ -203,6 +203,8 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
         dspark_log_snr_fc2_b = create_tensor(tn(LLM_TENSOR_DSPARK_LOG_SNR_FC2, "bias"),   { n_embd },         0);
         LLAMA_LOG_INFO("%s: DFlash with DSpark log-SNR conditioning (min %.3f, max %.3f)\n",
                 __func__, (double) hparams.dspark_min_log_snr, (double) hparams.dspark_max_log_snr);
+    }
+
     const struct ggml_tensor * selector_meta = ml->get_tensor_meta("selector_hidden.weight");
     if (selector_meta) {
         const int64_t rank = hparams.dflash_selector_rank;
