@@ -6816,8 +6816,16 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // This helps models with f16 attention weights, e.g., gpt-oss-20b-f16
     {
         const char * xmem_env = getenv("GGML_OPENCL_ADRENO_XMEM_GEMM");
+        // GluRun (patch 0012): off by default on an Adreno 6xx. That driver's compiler
+        // (Adreno 630, E031.37.12.05) builds these kernels and computes them wrong:
+        // MUL_MAT(f16) against the CPU is nmse 0.975 at n=16 with them and 8.7e-07 without
+        // (GluRun's prober, POCO F1, 2026-09-23), which capped the probed batch at 8, and the
+        // temporary weight prepack cost 109 s of extra load time on Bonsai 4B Q2_0 (147 s ->
+        // 38 s) for a prompt rate of 1.01 tok/s against 14.29 without it.
+        // GGML_OPENCL_ADRENO_XMEM_GEMM=1 forces them back on.
+        const bool xmem_default = backend_ctx->adreno_gen != ADRENO_GPU_GEN::A6X;
         backend_ctx->adreno_xmem_gemm_enabled = backend_ctx->gpu_family == GPU_FAMILY::ADRENO &&
-                                                (xmem_env ? atoi(xmem_env) != 0 : true);
+                                                (xmem_env ? atoi(xmem_env) != 0 : xmem_default);
     }
 #endif
 
