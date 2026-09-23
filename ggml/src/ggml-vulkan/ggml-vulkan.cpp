@@ -13646,6 +13646,14 @@ bool ggml_vk_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b, bool 
 
 bool ggml_vk_can_fuse_rms_norm_mul_rope(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                                int node_idx) {
+    // GluRun: the fused rms_norm+mul+rope shader miscomputes on Qualcomm
+    // Adreno drivers (Adreno 740, OnePlus CPH2585: test-backend-ops
+    // RMS_NORM_MUL_ROPE gives ERR ~2.0 / NaN for every multi-row case in rope
+    // modes 0 and 2, and Qwen3 decodes to garbage). The unfused ops are
+    // correct there, so skip this fusion on that vendor.
+    if (ctx->device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+        return false;
+    }
     const ggml_tensor *rms = cgraph->nodes[node_idx + 0];
     const ggml_tensor *mul = cgraph->nodes[node_idx + 1];
     const ggml_tensor *rope = cgraph->nodes[node_idx + 2];
