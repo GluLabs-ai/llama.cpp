@@ -1,4 +1,11 @@
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+// GluRun (patch 0005): the image3d_t writes below are core only from OpenCL C 3.0;
+// an OpenCL C 2.0 compiler (Adreno 630, E031.37) wants the extension enabled by
+// pragma or refuses "Writable 3d images require the 'cl_khr_3d_image_writes'
+// extension enabled." The host builds this program only when the device lists it.
+#ifdef cl_khr_3d_image_writes
+#pragma OPENCL EXTENSION cl_khr_3d_image_writes : enable
+#endif
 
 __kernel void kernel_repack_mask_for_wmm(
     const global half* mask_buf,

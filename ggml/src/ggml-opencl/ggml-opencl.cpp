@@ -654,6 +654,11 @@ struct ggml_backend_opencl_context {
     size_t max_workgroup_size;
     bool fp16_support;
     bool has_vector_subgroup_broadcast;
+    // GluRun (patch 0005): cl_khr_3d_image_writes listed by the device; the
+    // flash_attn_repack program writes image3d_t and does not compile without
+    // it (Adreno 630, OpenCL 2.0 driver), and ggml-opencl exits the process
+    // on a kernel compile error
+    bool has_3d_image_writes = false;
     bool has_subgroup_shuffle = false;       // cl_khr_subgroup_shuffle or cl_qcom_subgroup_shuffle
     bool has_integer_dot      = false;       // cl_khr_integer_dot_product or cl_qcom_dot_product8
     bool has_qcom_subgroup_shuffle = false;  // specifically cl_qcom_subgroup_shuffle
@@ -5183,8 +5188,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         GGML_LOG_CONT(".");
     }
 
-    // repack
-    {
+    // repack: only its consumer (use_fa_bin_kernels_prefill, Adreno binary
+    // flash attention) can dispatch these, and it is null-gated; without
+    // cl_khr_3d_image_writes the program does not compile (GluRun, patch 0005)
+    if (backend_ctx->has_3d_image_writes) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "flash_attn_repack.cl.h"
@@ -6612,6 +6619,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     // check support for qcom_subgroup_shuffle
     if (strstr(ext_buffer, "cl_qcom_subgroup_shuffle") != NULL) {
         backend_ctx->has_qcom_subgroup_shuffle = true;
+    }
+
+    // GluRun (patch 0005): 3D image writes (flash_attn_repack)
+    backend_ctx->has_3d_image_writes = strstr(ext_buffer, "cl_khr_3d_image_writes") != NULL;
+    if (!backend_ctx->has_3d_image_writes) {
+        GGML_LOG_INFO("ggml_opencl: device has no cl_khr_3d_image_writes: the flash_attn_repack kernels are not built (bin flash attention stays off)\n");
     }
 
     // Check if ext_buffer contains cl_khr_fp16
