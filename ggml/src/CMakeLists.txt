@@ -532,6 +532,10 @@ if (GGML_CPU_ALL_VARIANTS)
         elseif (CMAKE_SYSTEM_NAME MATCHES "Android")
             # Android-specific backends with SoC-compatible feature sets
             ggml_add_cpu_backend_variant(android_armv8.0_1)
+            # GluRun patch 0009: armv8.2-a+fp16 without the dot-product extension (Snapdragon 845
+            # class: fphp/asimdhp but no asimddp). Score 1+4 = 5 beats armv8.0_1 (1) and loses to
+            # every DOTPROD+FP16 variant (7 and up), so only fp16-without-dotprod CPUs pick it.
+            ggml_add_cpu_backend_variant(android_armv8.2_0    FP16_VECTOR_ARITHMETIC)
             ggml_add_cpu_backend_variant(android_armv8.2_1    DOTPROD)
             ggml_add_cpu_backend_variant(android_armv8.2_2    DOTPROD FP16_VECTOR_ARITHMETIC)
             ggml_add_cpu_backend_variant(android_armv8.6_1    DOTPROD FP16_VECTOR_ARITHMETIC MATMUL_INT8)
