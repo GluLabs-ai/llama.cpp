@@ -348,7 +348,19 @@ compile_count_guard acquire_compile_slot() {
 }
 
 void string_to_spv_func(std::string name, std::string in_path, std::string out_path, std::map<std::string, std::string> defines, bool coopmat, bool dep_file, compile_count_guard slot) {
-    std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" : "--target-env=vulkan1.2";
+#if defined(GGML_VULKAN_TARGET_VULKAN11)
+    // GluRun (patch 0004): SPIR-V 1.3 for every non-coopmat2 shader so that a
+    // Vulkan 1.1 driver accepts the modules (vulkan1.2 implies SPIR-V 1.5).
+    // The _cm2 (NV cooperative_matrix2) shaders keep vulkan1.3 and the im2col
+    // _bda ones vulkan1.2 (OpSpecConstantOp UConvert needs SPIR-V 1.4); neither
+    // is selected on such a device (no coopmat2; buffer_device_address is
+    // switched off on the 1.1 path in ggml-vulkan.cpp).
+    const char * default_target_env = "--target-env=vulkan1.1";
+#else
+    const char * default_target_env = "--target-env=vulkan1.2";
+#endif
+    std::string target_env = (name.find("_cm2") != std::string::npos) ? "--target-env=vulkan1.3" :
+                             (name.find("_bda") != std::string::npos) ? "--target-env=vulkan1.2" : default_target_env;
 
     #ifdef _WIN32
         std::vector<std::string> cmd = {GLSLC, "-fshader-stage=compute", target_env, "\"" + in_path + "\"", "-o", "\"" + out_path + "\""};

@@ -697,6 +697,10 @@ struct vk_device_struct {
     bool single_queue;
     bool support_async;
     bool async_use_transfer_queue;
+    // GluRun (patch 0004): false on a Vulkan 1.1 device without
+    // VK_KHR_timeline_semaphore; submissions then carry no semaphores, the
+    // transfer queue is not used asynchronously and events are not offered.
+    bool timeline_semaphore = true;
     bool has_internally_synchronized_queues = false;
     uint32_t subgroup_size;
     uint32_t subgroup_size_log2;

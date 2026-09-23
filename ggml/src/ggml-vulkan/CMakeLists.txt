@@ -147,6 +147,13 @@ if (Vulkan_FOUND)
         add_compile_definitions(GGML_VULKAN_VALIDATE)
     endif()
 
+    if (GGML_VULKAN_TARGET_VULKAN11)
+        # GluRun (patch 0004): non-coopmat2 shaders as SPIR-V 1.3, backend accepts Vulkan 1.1 devices
+        add_compile_definitions(GGML_VULKAN_TARGET_VULKAN11)
+        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -DGGML_VULKAN_TARGET_VULKAN11=ON)
+        message(STATUS "Vulkan shaders target vulkan1.1 (SPIR-V 1.3), Vulkan 1.1 devices accepted")
+    endif()
+
     if (GGML_VULKAN_RUN_TESTS)
         add_compile_definitions(GGML_VULKAN_RUN_TESTS)
         # the test path also calls ggml_graph_compute_with_ctx() (ggml-cpu)
