@@ -108,6 +108,13 @@ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// Mask out, for every query, the keys at position >= p (on top of the causal / sequence / SWA
+// masking). -1 switches it off. For an encoder prompt that is right-padded to a fixed length and
+// whose padding must not be attended to: the padded rows then see only the real tokens, which is
+// what the reference implementations of such encoders do with their attention_mask and what
+// llama.cpp's batch API cannot otherwise express.
+LLAMA_API void llama_set_kq_key_veto_from(struct llama_context * ctx, llama_pos p);
+
 // Set whether the context outputs the input embeddings of a specific layer
 LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid, bool value);
 

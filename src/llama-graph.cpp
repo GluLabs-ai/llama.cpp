@@ -547,6 +547,47 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     // (e.g. DFlash's KV-injection pass)
     if (self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+
+        // GluRun: llama_set_kq_key_veto_from(ctx, p) - every query ignores the keys of the tokens
+        // of this ubatch whose position is >= p, on top of the causal / sequence / SWA masking.
+        // It exists for an encoder prompt that is right-padded to a fixed length and whose
+        // padding must not be attended to: FLUX.2 Klein pads to 512 with <|endoftext|> and
+        // stable-diffusion.cpp's conditioner builds a [512, 512] additive mask that drops those
+        // keys, so a padded row sees only the real tokens - not earlier pads, not itself. Without
+        // it the 20 real rows of a Klein prompt match that encoder to 1e-6 and the 492 padded
+        // ones are unrelated (docs/FOLLOWUPS.md item 79).
+        //
+        // It vetoes the keys of *this ubatch* only, which is what a one-shot encoder pass needs
+        // (the whole prompt in one ubatch, the cache cleared first); pads already in the cache
+        // from an earlier batch are not covered.
+        if (cparams.kq_key_veto_from >= 0 && self_k_idxs && self_k_idxs->buffer) {
+            GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+            GGML_ASSERT(ggml_backend_buffer_is_host(self_k_idxs->buffer));
+            const int64_t   n_kv   = self_kq_mask->ne[0];
+            const int64_t   n_rows = ggml_nelements(self_kq_mask) / n_kv;
+            const int64_t * kidx   = (const int64_t *) self_k_idxs->data;
+            const auto veto = [&](auto * data) {
+                using T = std::remove_reference_t<decltype(*data)>;
+                const T neg_inf = llama_cast<T>(-INFINITY);
+                for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+                    if (ubatch->pos[i] < cparams.kq_key_veto_from) {
+                        continue;
+                    }
+                    const int64_t j = kidx[i];
+                    if (j < 0 || j >= n_kv) {
+                        continue;
+                    }
+                    for (int64_t r = 0; r < n_rows; ++r) {
+                        data[r*n_kv + j] = neg_inf;
+                    }
+                }
+            };
+            if (self_kq_mask->type == GGML_TYPE_F16) {
+                veto((ggml_fp16_t *) self_kq_mask->data);
+            } else {
+                veto((float *) self_kq_mask->data);
+            }
+        }
     }
 
     if (self_k_rot && self_k_rot->buffer) {

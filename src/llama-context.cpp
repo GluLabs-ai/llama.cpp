@@ -1333,6 +1333,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     cparams.embeddings_nextn_masked = masked;
 }
 
+void llama_context::set_kq_key_veto_from(llama_pos p) {
+    LLAMA_LOG_DEBUG("%s: p = %d\n", __func__, p);
+
+    cparams.kq_key_veto_from = p;
+}
+
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     LLAMA_LOG_DEBUG("%s: lid = %d, enable = %d\n", __func__, lid, enable);
 
@@ -4207,6 +4213,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
     ctx->set_embeddings_nextn(value, masked);
+}
+
+void llama_set_kq_key_veto_from(llama_context * ctx, llama_pos p) {
+    ctx->set_kq_key_veto_from(p);
 }
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {

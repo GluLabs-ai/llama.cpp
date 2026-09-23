@@ -134,6 +134,7 @@ struct llama_context {
     void set_dspark_ctx(const float * feat, int64_t n_ctx_rows, int64_t n_embd_cap, const int32_t * pos);
 
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_kq_key_veto_from(llama_pos p);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_warmup(bool value);

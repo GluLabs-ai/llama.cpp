@@ -23,6 +23,13 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // GluRun: keys at position >= kq_key_veto_from are masked out for every query, on top of the
+    // usual causal / sequence / SWA masking. -1 (the default) is off. It exists for encoder
+    // prompts that are right-padded to a fixed length and whose padding must not be attended to
+    // (FLUX.2 Klein pads to 512 with <|endoftext|> and masks those keys), which is otherwise not
+    // expressible: llama.cpp's batch API has no per-token "do not attend to me".
+    llama_pos kq_key_veto_from = -1;
+
     float rope_freq_base;
     float rope_freq_scale;
 
