@@ -1436,6 +1436,31 @@ static cl_program build_program_from_binary(cl_context ctx, cl_device_id dev, co
     return p;
 }
 
+// GluRun (patch 0011): the Adreno 6xx OpenCL compiler and the flash-attention
+// programs. On the POCO F1 (Adreno 630, "OpenCL 2.0 QUALCOMM build: commit
+// #8e5405b ... 05/21/21", compiler E031.37.12.05) ggml-opencl's lazy
+// flash-attention build sat inside clBuildProgram for 11 minutes at 0% CPU and
+// then took the whole SoC down: the screen stopped responding, `am` could no
+// longer reach the activity service and the phone had to be rebooted over adb
+// (docs/device-matrix.md, "OpenCL backend ... POCO F1"). The hang is inside the
+// vendor compiler, so no host-side watchdog can stop it - the only protection is
+// never to hand that compiler this source. Everything else ggml-opencl builds on
+// this driver is fine: the whole init-time kernel set, including GluRun's Q2_0 /
+// Q1_0 programs of patch 0006, compiled and ran there the same evening. So the
+// ban is exactly the flash-attention programs - the lazy variants, their
+// prepass, the DK=512 prefill tile, and the repack program whose only consumer
+// is the Adreno binary FA path - and supports_op declines FLASH_ATTN_EXT, so
+// llama.cpp keeps attention on the soft_max path.
+// GGML_OPENCL_A6X_FA=1 lifts it for a supervised experiment.
+static bool adreno_a6x_no_fa(const ggml_backend_opencl_context * backend_ctx) {
+    if (!backend_ctx || backend_ctx->gpu_family != GPU_FAMILY::ADRENO ||
+        backend_ctx->adreno_gen != ADRENO_GPU_GEN::A6X) {
+        return false;
+    }
+    const char * env = getenv("GGML_OPENCL_A6X_FA");
+    return !(env && env[0] == '1');
+}
+
 static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
     // compiler options for general kernels
     auto opencl_c_std =
@@ -5291,8 +5316,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
     // repack: only its consumer (use_fa_bin_kernels_prefill, Adreno binary
     // flash attention) can dispatch these, and it is null-gated; without
-    // cl_khr_3d_image_writes the program does not compile (GluRun, patch 0005)
-    if (backend_ctx->has_3d_image_writes) {
+    // cl_khr_3d_image_writes the program does not compile (GluRun, patch 0005),
+    // and on an Adreno 6xx no flash-attention source is handed to that compiler
+    // at all (GluRun, patch 0011)
+    if (backend_ctx->has_3d_image_writes && !adreno_a6x_no_fa(backend_ctx)) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "flash_attn_repack.cl.h"
@@ -5510,6 +5537,7 @@ static void ggml_opencl_log_fa_kernel_spill(ggml_backend_opencl_context * backen
 }
 
 static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * backend_ctx, int dk, int dv) {
+    if (adreno_a6x_no_fa(backend_ctx)) { return; }   // GluRun (patch 0011)
     const std::pair<int, int> dk_dv = {dk, dv};
 
     const ggml_opencl_fa_dim * cfg = nullptr;
@@ -5557,6 +5585,7 @@ static void ggml_opencl_ensure_fa_pre_kernels(ggml_backend_opencl_context * back
 
 // DK=512 prefill BM-tile
 static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_context * backend_ctx, bool split) {
+    if (adreno_a6x_no_fa(backend_ctx)) { return false; }   // GluRun (patch 0011)
     const int dk = 512, dv = 512;
     const std::pair<int, int> dk_dv = {dk, dv};
     auto & target = split ? backend_ctx->fa.f32_f16_split : backend_ctx->fa.f32_f16;
@@ -5619,6 +5648,7 @@ static bool ggml_opencl_ensure_fa_f32_f16_prefill_512(ggml_backend_opencl_contex
 
 // Compile one (variant, dk, dv); memoised. false = compiler rejected.
 static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_ctx, int dk, int dv, ggml_opencl_fa_variant variant) {
+    if (adreno_a6x_no_fa(backend_ctx)) { return false; }   // GluRun (patch 0011)
     const std::pair<int, int> dk_dv = {dk, dv};
 
     const ggml_opencl_fa_dim * cfg = nullptr;
@@ -6192,6 +6222,7 @@ static bool ggml_opencl_ensure_fa_quant_split_override(
         ggml_backend_opencl_context * backend_ctx,
         int dk, int dv, int quant_bm, int quant_n_split, bool is_q8_0
 ) {
+    if (adreno_a6x_no_fa(backend_ctx)) { return false; }   // GluRun (patch 0011)
     const std::pair<int, int> dk_dv = {dk, dv};
     if (is_q8_0 && backend_ctx->fa.f32_q8_0_split.count(dk_dv)) {
         return true;
@@ -6669,6 +6700,12 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 
     backend_ctx->gpu_family = dev_ctx->gpu_family;
     backend_ctx->adreno_gen = dev_ctx->adreno_gen;
+    if (adreno_a6x_no_fa(backend_ctx.get())) {
+        // GluRun (patch 0011)
+        GGML_LOG_INFO("ggml_opencl: Adreno 6xx: the flash-attention programs are never built on this "
+                      "driver (it hung the GPU and froze the phone); FLASH_ATTN_EXT is declined "
+                      "(GGML_OPENCL_A6X_FA=1 lifts it)\n");
+    }
     if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
         ggml_cl_init_fa_dims_table();
 
@@ -9215,6 +9252,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_MEAN:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT: {
+            // GluRun (patch 0011): never on an Adreno 6xx driver - building these
+            // programs froze the POCO F1. Declining the op keeps attention on
+            // mul_mat/soft_max, which is what this backend runs there anyway.
+            if (adreno_a6x_no_fa(backend_ctx)) {
+                return false;
+            }
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
             if (use_fa_bin_kernels_prefill(backend_ctx, op->src[0], op->src[1], op->src[2])) {
                 return true;
