@@ -1,0 +1,33 @@
+# GluRun SDK: what this llama.cpp tree is.
+#
+# This file is the build's sanity check. engines/llamacpp/CMakeLists.txt in the
+# GluRun SDK reads it out of the submodule checkout and refuses to configure if
+# it is missing or if a feature the SDK needs is not listed - the message then
+# tells you to run `git submodule update --init`. No patches are applied at
+# build time any more (docs/BUILD.md "The llama.cpp base").
+#
+# Layout of the branch:
+#   upstream          ggml-org/llama.cpp at the sha below
+#   + merge           PrismML-Eng/llama.cpp `prism` at the sha below, merged in
+#                     with GluRun's conflict resolutions (one merge commit plus
+#                     a post-merge build-fix commit)
+#   + one commit per feature= line below, in this order
+#
+# Adding a change: commit it on this branch in the GluRun fork, add a feature=
+# line here in the same commit, push, then bump the submodule in the SDK and
+# add the id to GLURUN_LLAMA_BASE_FEATURES in engines/llamacpp/CMakeLists.txt
+# if the SDK depends on it.
+branch=glurun/main
+fork=https://github.com/GluLabs-ai/llama.cpp
+upstream=3cf03257f219afbe7334045ff7c6a06ac68c627d
+prism=bdc23b56b4458b9f1655aec5287f3ab56ee8daaa
+feature=vulkan-no-rms-rope-fusion-on-qualcomm
+feature=vulkan-1.1-compat
+feature=opencl-skip-3d-image-repack
+feature=opencl-q2_0-q1_0
+feature=hexagon-q2_0-q1_0
+feature=vulkan-adreno-kernels
+feature=cpu-android-armv8.2-fp16-variant
+feature=llama-kq-key-veto
+feature=opencl-no-flash-attn-on-adreno-6xx
+feature=opencl-no-xmem-gemm-on-adreno-6xx
