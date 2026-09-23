@@ -76,7 +76,14 @@ uint mm_load_vec_a() {
 #define TO_FLOAT_TYPE FLOAT_TYPE
 #endif
 
+#ifdef GGML_VK_MM_CONST_TILE
+// GluRun: upstream's s tile (BLOCK 64, BM/BN 32, BK 32, WM/WN 32, WMITER 2, TM/TN 2, WARP 64)
+// as compile-time constants. The Qualcomm Adreno compiler does not specialise the unrolled
+// loops on specialisation constants; the same tile hard-coded runs 2x faster there.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 #ifndef MULMAT_QUANT
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
@@ -158,6 +165,20 @@ layout (push_constant) uniform parameter
 #endif
 } p;
 
+#ifdef GGML_VK_MM_CONST_TILE
+const uint BLOCK_SIZE = 64;
+const uint BM = 32;
+const uint BN = 32;
+const uint WM = 32;
+const uint WN = 32;
+const uint WMITER = 2;
+const uint TM = 2;
+const uint TN = 2;
+const uint TK = 1;
+const uint WARP = 64;
+const uint BK = 32;
+#define BK_STEP 2
+#else
 layout (constant_id = 0) const uint BLOCK_SIZE = 64;
 layout (constant_id = 1) const uint BM = 64;
 layout (constant_id = 2) const uint BN = 64;
@@ -175,6 +196,7 @@ layout (constant_id = 10) const uint WARP = 32;
 #else
 layout (constant_id = 3) const uint BK = 16;  // Assumed to be 32 if working with a quant
 #define BK_STEP 2
+#endif
 #endif
 
 #ifdef COOPMAT

@@ -680,6 +680,17 @@ void matmul_shaders(bool fp16, MatMulIdType matmul_id_type, bool coopmat, bool c
 
         if (!coopmat2) {
             string_to_spv(shader_name + "_quant_f32" + dot2_sfx, source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), {{"MULMAT_QUANT", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+
+            // The same shader restricted to the MmTypeA values the Qualcomm Adreno driver can compile
+            // (GGML_VK_QUANT_SUBSET / GGML_VK_NO_INT8 in mul_mm_funcs.glsl); selected per vendor in ggml-vulkan.cpp.
+            if (!coopmat && !dot2 && matmul_id_type == MatMulIdType::NONE) {
+                string_to_spv(shader_name + "_quant_f32_adreno", source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), {{"MULMAT_QUANT", "1"}, {"GGML_VK_NO_INT8", "1"}, {"GGML_VK_QUANT_SUBSET", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+                // The subset module with upstream's s tile as compile-time constants (GGML_VK_MM_CONST_TILE in
+                // mul_mm.comp): the Adreno compiler does not specialise the loops on specialisation constants.
+                if (fp16) {
+                    string_to_spv(shader_name + "_quant_f32_adreno_ct", source_name, merge_maps(merge_maps(base_dict, quant_float_type_dict), {{"MULMAT_QUANT", "1"}, {"GGML_VK_NO_INT8", "1"}, {"GGML_VK_QUANT_SUBSET", "1"}, {"GGML_VK_MM_CONST_TILE", "1"}, {"LOAD_VEC_B", load_vec}, {"B_TYPE", aligned_b_type_f32}, {"B_TYPE_SCALAR", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}), fp16, coopmat, coopmat2, f16acc);
+                }
+            }
         }
     }
 }
@@ -931,6 +942,11 @@ void process_shaders() {
     string_to_spv("acc_f32", "acc.comp", {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 
     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
+    // GluRun: the register-tiled Q2_0 x f32 matmul for Qualcomm Adreno (TM x TN outputs per thread);
+    // source: kernels/vulkan/mul_mm_q2_0_adreno/mul_mm_q2_0_adreno.comp in the GluRun SDK.
+    string_to_spv("mul_mm_q2_0_adreno_r1", "mul_mm_q2_0_adreno.comp", {{"TM", "4"}, {"TN", "4"}});
+    string_to_spv("mul_mm_q2_0_adreno_r2", "mul_mm_q2_0_adreno.comp", {{"TM", "4"}, {"TN", "8"}});
+    string_to_spv("mul_mm_q2_0_adreno_r3", "mul_mm_q2_0_adreno.comp", {{"TM", "8"}, {"TN", "4"}});
     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
 
     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});

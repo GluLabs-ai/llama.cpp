@@ -1411,6 +1411,29 @@ static std::vector<uint32_t> get_fa_spec_constants(const vk_fa_pipeline_state& s
     };
 }
 
+// Weight types compiled into matmul_quant_f32_adreno (GGML_VK_QUANT_SUBSET in mul_mm_funcs.glsl).
+// Keep in sync with engines/llamacpp/patches/0008 in the GluRun SDK.
+static bool ggml_vk_adreno_quant_subset(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// GluRun: an integer environment switch of the Adreno matmul selection, `def` when unset or unparsable.
+static int ggml_vk_adreno_env(const char * name, int def) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return def;
+    }
+    char * end = nullptr;
+    const long x = strtol(v, &end, 10);
+    return end != v ? (int) x : def;
+}
+
 static bool ggml_vk_matmul_shmem_support(const vk_device& device, const std::vector<uint32_t>& warptile, bool mul_mat_id, ggml_type src0_type) {
 
     uint32_t lut_size = 0;
@@ -2446,6 +2469,55 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             sg_create({GGML_TYPE_BF16, GGML_TYPE_BF16, false, false}, tc_mm, "matmul_bf16", matmul_bf16_len, matmul_bf16_data, sizeof(vk_mat_mat_push_constants), 3);
 
             for (const auto type : non_lut_quant_types) {
+                if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+                    // GluRun: Adreno's shader compiler rejects the upstream matmul_quant module
+                    // (vkCreateComputePipeline -> ErrorUnknown, "Failed to link shaders"). The
+                    // module with only the types below compiles and passes test-backend-ops; the
+                    // other types get no tiled pipeline here and go through dequant + f16 matmul.
+                    // See kernels/README.md in the SDK.
+                    if (!ggml_vk_adreno_quant_subset(type)) {
+                        continue;
+                    }
+                    // Q2_0: the register-tiled kernel (kernels/vulkan/mul_mm_q2_0_adreno/mul_mm_q2_0_adreno.comp
+                    // in the SDK), no shared memory and no specialisation constants; r3 = 8x4 outputs per
+                    // thread. Adreno 740: 415-460 GFLOPS against 87 for the constant-tile module, 27/27
+                    // shapes correct, llama-bench pp512 45.85 vs 10.38 tok/s. GGML_VK_ADRENO_MM_REG=1/2
+                    // selects the 4x4 / 4x8 variants, 0 the tiled module below.
+                    if (type == GGML_TYPE_Q2_0) {
+                        const int reg = ggml_vk_adreno_env("GGML_VK_ADRENO_MM_REG", 3);
+                        std::vector<vk_tile_config> tc_reg;
+                        size_t reg_len = 0; const void * reg_data = nullptr; const char * reg_name = nullptr;
+                        switch (reg) {
+                            case 1: tc_reg = {{{64, 32, 32, 64, 32, 32, 1, 4, 4, 1, 64}, {32, 32, 1}, 64}};
+                                    reg_len = mul_mm_q2_0_adreno_r1_len; reg_data = mul_mm_q2_0_adreno_r1_data; reg_name = "mul_mm_q2_0_adreno_r1"; break;
+                            case 2: tc_reg = {{{64, 32, 64, 64, 32, 64, 1, 4, 8, 1, 64}, {32, 64, 1}, 64}};
+                                    reg_len = mul_mm_q2_0_adreno_r2_len; reg_data = mul_mm_q2_0_adreno_r2_data; reg_name = "mul_mm_q2_0_adreno_r2"; break;
+                            case 3: tc_reg = {{{64, 64, 32, 64, 64, 32, 1, 8, 4, 1, 64}, {64, 32, 1}, 64}};
+                                    reg_len = mul_mm_q2_0_adreno_r3_len; reg_data = mul_mm_q2_0_adreno_r3_data; reg_name = "mul_mm_q2_0_adreno_r3"; break;
+                            default: break;
+                        }
+                        if (reg_data != nullptr) {
+                            // one tile, no specialisation constants; the f16acc key gets the same (fp32-accumulating) module
+                            spec_fn_t none = [](const std::vector<uint32_t>&, bool) { return std::vector<uint32_t>{}; };
+                            create_mm_pipelines({type, GGML_TYPE_F32, false, true},  tc_reg, reg_name, reg_len, reg_data, sizeof(vk_mat_mat_push_constants), 3, none);
+                            create_mm_pipelines({type, GGML_TYPE_F32, false, false}, tc_reg, reg_name, reg_len, reg_data, sizeof(vk_mat_mat_push_constants), 3, none);
+                            continue;
+                        }
+                    }
+                    // Q4_0 (and Q2_0 with GGML_VK_ADRENO_MM_REG=0): the subset module with upstream's s tile
+                    // as compile-time constants. The driver does not specialise mul_mm.comp's unrolled loops on
+                    // specialisation constants; the same tile hard-coded is 2x faster (87 vs 43 GFLOPS, Adreno
+                    // 740). GGML_VK_ADRENO_MM_CONST_TILE=0 selects the specialisation-constant module (s/m/l).
+                    if (ggml_vk_adreno_env("GGML_VK_ADRENO_MM_CONST_TILE", 1) != 0) {
+                        const std::vector<vk_tile_config> tc_ct = {{{64, 32, 32, 32, 32, 32, 2, 2, 2, 1, 64}, {32, 32, 1}, 32}};
+                        sg_create_quant({type, GGML_TYPE_F32, false, true},  tc_ct, "matmul_quant_f32_adreno_ct_f16acc", matmul_quant_f32_adreno_ct_f16acc_len, matmul_quant_f32_adreno_ct_f16acc_data, sizeof(vk_mat_mat_push_constants), 3);
+                        sg_create_quant({type, GGML_TYPE_F32, false, false}, tc_ct, "matmul_quant_f32_adreno_ct",        matmul_quant_f32_adreno_ct_len,        matmul_quant_f32_adreno_ct_data,        sizeof(vk_mat_mat_push_constants), 3);
+                    } else {
+                        sg_create_quant({type, GGML_TYPE_F32, false, true},  tc_mmq, "matmul_quant_f32_adreno_f16acc", matmul_quant_f32_adreno_f16acc_len, matmul_quant_f32_adreno_f16acc_data, sizeof(vk_mat_mat_push_constants), 3);
+                        sg_create_quant({type, GGML_TYPE_F32, false, false}, tc_mmq, "matmul_quant_f32_adreno",        matmul_quant_f32_adreno_len,        matmul_quant_f32_adreno_data,        sizeof(vk_mat_mat_push_constants), 3);
+                    }
+                    continue;
+                }
                 sg_create_quant({type, GGML_TYPE_F32, false, true},  tc_mmq, "matmul_quant_f32_f16acc", SPV_DOT2_F16ACC(matmul_quant_f32), sizeof(vk_mat_mat_push_constants), 3);
                 sg_create_quant({type, GGML_TYPE_F32, false, false}, tc_mmq, "matmul_quant_f32",        SPV_DOT2(matmul_quant_f32),        sizeof(vk_mat_mat_push_constants), 3);
             }
@@ -2559,6 +2631,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             sg_create({GGML_TYPE_BF16, GGML_TYPE_BF16, false, false}, tc_mm, "matmul_bf16",  matmul_bf16_fp32_len,    matmul_bf16_fp32_data,    sizeof(vk_mat_mat_push_constants), 3);
 
             for (const auto type : non_lut_quant_types) {
+                if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+                    if (ggml_vk_adreno_quant_subset(type)) {
+                        sg_create_quant({type, GGML_TYPE_F32, false, false}, tc_mmq, "matmul_quant_f32_adreno", matmul_quant_f32_adreno_fp32_len, matmul_quant_f32_adreno_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
+                    }
+                    continue;
+                }
                 sg_create_quant({type, GGML_TYPE_F32, false, false}, tc_mmq, "matmul_quant_f32", matmul_quant_f32_fp32_len, matmul_quant_f32_fp32_data, sizeof(vk_mat_mat_push_constants), 3);
             }
     #define X_SG_FP32(TYPE, tstr) \
@@ -4091,6 +4169,13 @@ vk_device ggml_vk_get_device(size_t idx) {
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
             device->max_nodes_per_submit = std::max(max_nodes_per_submit, 1u);
+        } else if (device->vendor_id == VK_VENDOR_ID_QUALCOMM) {
+            // GluRun: the Adreno driver's watchdog kills a command buffer that runs longer
+            // than a few seconds (vk::Queue::submit: ErrorDeviceLost on prompt batches >= 128
+            // with the tiled matmul, kernels/README.md finding 1). Eight nodes per submit
+            // keeps every measured shape under it at no measurable cost (Adreno 740:
+            // 11.16 tok/s at 1, 8 and 100 nodes). GGML_VK_MAX_NODES_PER_SUBMIT still wins.
+            device->max_nodes_per_submit = 8;
         }
 
         const bool force_disable_f16 = getenv("GGML_VK_DISABLE_F16") != nullptr;
@@ -8728,10 +8813,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         }
 
         if (src0->type == GGML_TYPE_F32 && (src1 == nullptr || src1->type == GGML_TYPE_F32) && dst->type == GGML_TYPE_F32) {
-            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_wg512 : ctx->device->pipeline_soft_max_f32;
+            // GluRun: the 512-wide soft_max computes wrong rows on Qualcomm Adreno (Adreno 740,
+            // driver 512.676: test-backend-ops SOFT_MAX ne=[1280,1,12,1] ERR ~1.0, and a decode
+            // step over more than 1024 cached tokens lost the device); the subgroup-wide
+            // pipeline handles any row length and is correct there.
+            return src0->ne[0] > 1024 && ctx->device->vendor_id != VK_VENDOR_ID_QUALCOMM ? ctx->device->pipeline_soft_max_f32_wg512 : ctx->device->pipeline_soft_max_f32;
         }
         if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-            return src0->ne[0] > 1024 ? ctx->device->pipeline_soft_max_f32_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16;
+            return src0->ne[0] > 1024 && ctx->device->vendor_id != VK_VENDOR_ID_QUALCOMM ? ctx->device->pipeline_soft_max_f32_f16_wg512 : ctx->device->pipeline_soft_max_f32_f16;
         }
         return nullptr;
     case GGML_OP_SOFT_MAX_BACK:
