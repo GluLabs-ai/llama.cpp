@@ -1,4 +1,5 @@
 #include <alloca.h>
+#include "../../quants.h"
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -2167,6 +2168,15 @@ static inline void ggml_q1_0_lut_rows16(const block_q1_0x16 * GGML_RESTRICT b_pt
 }
 #endif
 
+// Rows past the last full 16-row group are plain Q1_0 rows (repack_q1_0_to_q1_0_16_bl).
+static inline void ggml_q1_0_16x1_tail_gemv(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
+                                            const void * GGML_RESTRICT vy, int nfull, int nc) {
+    const size_t row = (size_t) (n / QK1_0) * sizeof(block_q1_0);
+    for (int r = nfull; r < nc; r++) {
+        ggml_vec_dot_q1_0_q8_0(n, s + r, 0, (const char *) vx + (size_t) r * row, 0, vy, 0, 1);
+    }
+}
+
 void ggml_gemv_q1_0_16x1_q8_0(int                        n,
                               float * GGML_RESTRICT      s,
                               size_t                     bs,
@@ -2180,15 +2190,61 @@ void ggml_gemv_q1_0_16x1_q8_0(int                        n,
     uint8_t * tab  = (uint8_t *) alloca((size_t) (n / 4) * 32);
     float *   ad   = (float *) alloca((size_t) nsub * sizeof(float));
     const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+    bool shared = true;  // one scale per 128 (ggml_quantize_row_q8_0_g128)
     for (int b = 0; b < nsub; b++) {
         ad[b] = GGML_CPU_FP16_TO_FP32(a_ptr[b].d);
+        shared = shared && a_ptr[b].d == a_ptr[b - b % 4].d;
         for (int g = 0; g < 8; g++) {
             ggml_q1_0_lut_build(a_ptr[b].qs + 4 * g, tab + (size_t) (b * 8 + g) * 32);
         }
     }
-    for (int x = 0; x < nc / 16; x++) {
-        ggml_q1_0_lut_rows16((const block_q1_0x16 *) vx + x * nb, nb, tab, ad, s + x * 16);
+    const int nfull = nc - nc % 16;
+    if (!shared) {
+        for (int x = 0; x < nfull / 16; x++) {
+            ggml_q1_0_lut_rows16((const block_q1_0x16 *) vx + x * nb, nb, tab, ad, s + x * 16);
+        }
+        ggml_q1_0_16x1_tail_gemv(n, s, vx, vy, nfull, nc);
+        return;
     }
+    // Row-group outer (the weights stream in order, which the prefetcher follows; a
+    // block-outer order was slower, 3.47 vs 5.38 t/s single-thread on the POCO), and a
+    // whole 128-weight block summed in 16 bits (at most 32 x 508) and converted once.
+    const uint8x16_t m4 = vdupq_n_u8(0x0F);
+    for (int x = 0; x < nfull / 16; x++) {
+        const block_q1_0x16 * GGML_RESTRICT b_ptr = (const block_q1_0x16 *) vx + (size_t) x * nb;
+        float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0), acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
+        for (int l = 0; l < nb; l++) {
+            const uint8_t * tl = tab + (size_t) l * 32 * 32;
+            int16x8_t s0 = vdupq_n_s16(0);
+            int16x8_t s1 = vdupq_n_s16(0);
+            for (int b = 0; b < 16; b++) {
+                const uint8x16_t v = vld1q_u8(b_ptr[l].qs + 16 * b);
+                const uint8_t *  t = tl + (size_t) b * 64;
+                uint8x16_t idx = vandq_u8(v, m4);
+                uint8x16_t lo  = vqtbl1q_u8(vld1q_u8(t), idx);
+                uint8x16_t hi  = vqtbl1q_u8(vld1q_u8(t + 16), idx);
+                s0 = vaddq_s16(s0, vreinterpretq_s16_u8(vzip1q_u8(lo, hi)));
+                s1 = vaddq_s16(s1, vreinterpretq_s16_u8(vzip2q_u8(lo, hi)));
+                idx = vshrq_n_u8(v, 4);
+                lo  = vqtbl1q_u8(vld1q_u8(t + 32), idx);
+                hi  = vqtbl1q_u8(vld1q_u8(t + 48), idx);
+                s0 = vaddq_s16(s0, vreinterpretq_s16_u8(vzip1q_u8(lo, hi)));
+                s1 = vaddq_s16(s1, vreinterpretq_s16_u8(vzip2q_u8(lo, hi)));
+            }
+            const float       dl  = ad[l * 4];
+            const float16x8_t d01 = vld1q_f16((const float16_t *) b_ptr[l].d);
+            const float16x8_t d23 = vld1q_f16((const float16_t *) b_ptr[l].d + 8);
+            acc0 = vfmaq_f32(acc0, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s0))), vmulq_n_f32(vcvt_f32_f16(vget_low_f16(d01)), dl));
+            acc1 = vfmaq_f32(acc1, vcvtq_f32_s32(vmovl_high_s16(s0)),          vmulq_n_f32(vcvt_high_f32_f16(d01), dl));
+            acc2 = vfmaq_f32(acc2, vcvtq_f32_s32(vmovl_s16(vget_low_s16(s1))), vmulq_n_f32(vcvt_f32_f16(vget_low_f16(d23)), dl));
+            acc3 = vfmaq_f32(acc3, vcvtq_f32_s32(vmovl_high_s16(s1)),          vmulq_n_f32(vcvt_high_f32_f16(d23), dl));
+        }
+        vst1q_f32(s + x * 16 + 0, acc0);
+        vst1q_f32(s + x * 16 + 4, acc1);
+        vst1q_f32(s + x * 16 + 8, acc2);
+        vst1q_f32(s + x * 16 + 12, acc3);
+    }
+    ggml_q1_0_16x1_tail_gemv(n, s, vx, vy, nfull, nc);
     return;
 #endif
     ggml_gemv_q1_0_16x1_q8_0_generic(n, s, bs, vx, vy, nr, nc);
@@ -2209,6 +2265,9 @@ void ggml_gemm_q1_0_16x1_q8_0(int                        n,
     uint8_t * tab  = (uint8_t *) alloca((size_t) (n / 4) * 32);
     float *   ad   = (float *) alloca((size_t) nsub * sizeof(float));
     float     out[16];
+    // allocated once: alloca inside the row loop grew the stack by ~2 KB per activation
+    // row and overflowed a worker thread's stack on a 2048-token batch (segfault)
+    block_q8_0 * row = (block_q8_0 *) alloca((size_t) nsub * sizeof(block_q8_0));
     for (int y = 0; y < nr / 4; y++) {
         const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (size_t) y * nsub;
         for (int m = 0; m < 4; m++) {
@@ -2218,9 +2277,19 @@ void ggml_gemm_q1_0_16x1_q8_0(int                        n,
                     ggml_q1_0_lut_build(a_ptr[b].qs + g * 16 + m * 4, tab + (size_t) (b * 8 + g) * 32);
                 }
             }
-            for (int x = 0; x < nc / 16; x++) {
+            for (int x = 0; x < (nc - nc % 16) / 16; x++) {
                 ggml_q1_0_lut_rows16((const block_q1_0x16 *) vx + x * nb, nb, tab, ad, out);
                 memcpy(s + (y * 4 + m) * bs + x * 16, out, sizeof(out));
+            }
+            if (nc % 16) {
+                // the plain tail rows: this activation row back to plain block_q8_0
+                for (int b = 0; b < nsub; b++) {
+                    row[b].d = a_ptr[b].d[m];
+                    for (int j = 0; j < QK8_0; j++) {
+                        row[b].qs[j] = a_ptr[b].qs[(j / 4) * 16 + m * 4 + (j % 4)];
+                    }
+                }
+                ggml_q1_0_16x1_tail_gemv(n, s + (y * 4 + m) * bs, vx, row, nc - nc % 16, nc);
             }
         }
     }

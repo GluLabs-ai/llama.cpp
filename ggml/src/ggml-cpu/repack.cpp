@@ -436,6 +436,13 @@ template <> inline void ggml_repack_quantize_row<block_q1_0, 8, GGML_TYPE_Q8_0>(
     ggml_quantize_row_q8_0_g128(x, vy, n);
 }
 
+// Q1_0 with 4-row interleave (the 4x4 and 16x1 kernels): one scale per 128 activations
+// too. The layout is plain block_q8_0 with the scale repeated, so every Q1_0 kernel reads
+// it as it is; the 16x1 lookup GEMV uses the shared scale to convert once per block.
+template <> inline void ggml_repack_quantize_row<block_q1_0, 4, GGML_TYPE_Q8_0>(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t n) {
+    ggml_quantize_row_q8_0_g128(x, vy, n);
+}
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, ggml_type PARAM_TYPE>
 static inline void ggml_repack_quantize_mat(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t nrow, int64_t n_per_row) {
     ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>(x, vy, nrow, n_per_row);
@@ -4281,10 +4288,13 @@ static int repack_q1_0_to_q1_0_16_bl(struct ggml_tensor * t, const void * GGML_R
     const int          nrow    = ggml_nrows(t);
     const int          nblocks = t->ne[0] / QK1_0;
     GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_q1_0));
-    if (t->ne[1] % nrows_interleaved != 0) {
-        return -1;
-    }
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    // Rows past the last full group of 16 stay as plain Q1_0 rows at the end. A group
+    // of 16 repacked rows takes exactly the bytes of 16 plain rows, so every row offset
+    // (row * nb01) still points where the kernels expect, and they dot the tail rows
+    // one at a time. Bonsai's vocabulary is 151669, so its output layer - a fifth of
+    // the work per token - needs this to be repacked at all.
+    const int nfull = nrow - nrow % nrows_interleaved;
+    for (int b = 0; b < nfull; b += nrows_interleaved) {
         for (int64_t x = 0; x < nblocks; x++) {
             block_q1_0x16 out;
             for (int r = 0; r < 16; r++) {
@@ -4298,6 +4308,7 @@ static int repack_q1_0_to_q1_0_16_bl(struct ggml_tensor * t, const void * GGML_R
         }
         src += nrows_interleaved * nblocks;
     }
+    memcpy((void *) dst, src, (size_t) (nrow - nfull) * nblocks * sizeof(block_q1_0));
     return 0;
 }
 
@@ -5698,8 +5709,8 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 return &q1_0_4x8_q8_0;
             }
         }
-        if (ggml_cpu_has_neon() && !ggml_cpu_has_dotprod() && cur->ne[1] % 16 == 0) {
-            // no dot product: the lookup-table kernels (16 rows, vqtbl1q)
+        if (ggml_cpu_has_neon() && !ggml_cpu_has_dotprod()) {
+            // no dot product: the lookup-table kernels (16 rows, vqtbl1q), any row count
             return &q1_0_16x1_q8_0;
         }
         if (ggml_cpu_has_neon()) {
