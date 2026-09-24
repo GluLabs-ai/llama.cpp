@@ -5584,7 +5584,8 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
                 return &q1_0_4x8_q8_0;
             }
         }
-        if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
+        if (ggml_cpu_has_neon()) {
+            // with the dot product where the CPU has it, vmlal_s8 where it does not
             if (cur->ne[1] % 4 == 0) {
                 return &q1_0_4x4_q8_0;
             }

@@ -1824,7 +1824,7 @@ void ggml_gemv_q8_0_4x8_q8_0(int                        n,
     ggml_gemv_q8_0_4x8_q8_0_generic(n, s, bs, vx, vy, nr, nc);
 }
 
-#if defined(__aarch64__) && defined(__ARM_NEON) && (defined(__ARM_FEATURE_DOTPROD) || defined(__ARM_FEATURE_MATMUL_INT8))
+#if defined(__aarch64__) && defined(__ARM_NEON)
 #define B1(c,s,n)  0x ## n ## c ,  0x ## n ## s
 #define B2(c,s,n) B1(c,s,n ## c), B1(c,s,n ## s)
 #define B3(c,s,n) B2(c,s,n ## c), B2(c,s,n ## s)
@@ -2152,6 +2152,85 @@ void ggml_gemv_q1_0_4x4_q8_0(int                        n,
         }
         vst1q_f32(s, acc);
         s += ncols_interleaved;
+    }
+    return;
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    // No dot product (e.g. Snapdragon 845). Byte 2t+h of a sub-block's 16 bytes holds
+    // tile t of rows 2h (bits 0-3) and 2h+1 (bits 4-7), bit p = weight position p. A
+    // shift and a mask give one position's bits for 8 tiles x 2 rows; the dot is
+    // 2*sum(bit*a) - sum(a). Activations are permuted once per call to that lane order
+    // (A[p] = a[4t+p], each twice) and reused by every column group.
+    {
+        const int nsub = n / QK8_0;
+        int8_t *  perm = (int8_t *) alloca((size_t) n * 2);
+        int32_t * asum = (int32_t *) alloca((size_t) nsub * sizeof(int32_t));
+        float *   ad   = (float *) alloca((size_t) nsub * sizeof(float));
+        const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+        static const uint8_t pidx[4][16] = {
+            { 0, 0, 4, 4, 8, 8, 12, 12, 16, 16, 20, 20, 24, 24, 28, 28 },
+            { 1, 1, 5, 5, 9, 9, 13, 13, 17, 17, 21, 21, 25, 25, 29, 29 },
+            { 2, 2, 6, 6, 10, 10, 14, 14, 18, 18, 22, 22, 26, 26, 30, 30 },
+            { 3, 3, 7, 7, 11, 11, 15, 15, 19, 19, 23, 23, 27, 27, 31, 31 },
+        };
+        for (int b = 0; b < nsub; b++) {
+            ad[b] = GGML_CPU_FP16_TO_FP32(a_ptr[b].d);
+            int8x16x2_t a32;
+            a32.val[0] = vld1q_s8(a_ptr[b].qs);
+            a32.val[1] = vld1q_s8(a_ptr[b].qs + 16);
+            asum[b] = vaddlvq_s8(a32.val[0]) + vaddlvq_s8(a32.val[1]);
+            for (int q = 0; q < 4; q++) {
+                vst1q_s8(perm + ((size_t) b * 4 + q) * 16, vqtbl2q_s8(a32, vld1q_u8(pidx[q])));
+            }
+        }
+        const uint8x16_t one = vdupq_n_u8(1);
+
+        for (int c = 0; c < nc; c += 4) {
+            const block_q1_0x4 * b_ptr = (const block_q1_0x4 *) vx + (c / 4) * nb;
+            float32x4_t acc = vdupq_n_f32(0);
+
+            for (int l = 0; l < nb; l++) {
+                const float32x4_t b_d  = vcvt_f32_f16(vld1_f16((const float16_t *) b_ptr[l].d));
+                float32x4_t       accb = vdupq_n_f32(0);
+
+                for (int k = 0; k < 4; k++) {
+                    const int       sb = l * 4 + k;
+                    const uint8x16_t v  = vld1q_u8((const uint8_t *) b_ptr[l].qs + k * 16);
+                    const int8_t *   pa = perm + (size_t) sb * 64;
+                    int16x8_t elo = vdupq_n_s16(0), ehi = vdupq_n_s16(0);  // rows 0 / 2
+                    int16x8_t olo = vdupq_n_s16(0), ohi = vdupq_n_s16(0);  // rows 1 / 3
+#define GGML_Q1_PLANE(P)                                                                            \
+                    {                                                                               \
+                        const int8x16_t a  = vld1q_s8(pa + (P) * 16);                               \
+                        const int8x16_t be = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, (P)), one)); \
+                        const int8x16_t bo = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, (P) + 4), one)); \
+                        elo = vmlal_s8(elo, vget_low_s8(be), vget_low_s8(a)); ehi = vmlal_high_s8(ehi, be, a); \
+                        olo = vmlal_s8(olo, vget_low_s8(bo), vget_low_s8(a)); ohi = vmlal_high_s8(ohi, bo, a); \
+                    }
+                    {
+                        const int8x16_t a  = vld1q_s8(pa);
+                        const int8x16_t be = vreinterpretq_s8_u8(vandq_u8(v, one));
+                        const int8x16_t bo = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 4), one));
+                        elo = vmlal_s8(elo, vget_low_s8(be), vget_low_s8(a)); ehi = vmlal_high_s8(ehi, be, a);
+                        olo = vmlal_s8(olo, vget_low_s8(bo), vget_low_s8(a)); ohi = vmlal_high_s8(ohi, bo, a);
+                    }
+                    GGML_Q1_PLANE(1)
+                    GGML_Q1_PLANE(2)
+                    GGML_Q1_PLANE(3)
+#undef GGML_Q1_PLANE
+                    // lanes 2t+h; even lanes are row 2h=0 group ... split halves, then rows 0,1,2,3
+                    const int16x8_t E = vaddq_s16(elo, ehi);   // [t h] pairs: h0 = row 0, h1 = row 2
+                    const int16x8_t O = vaddq_s16(olo, ohi);   // h0 = row 1, h1 = row 3
+                    const int32x4_t ev = vpaddlq_s16(vuzp1q_s16(E, O));  // [r0, r0, r1, r1]
+                    const int32x4_t od = vpaddlq_s16(vuzp2q_s16(E, O));  // [r2, r2, r3, r3]
+                    int32x4_t sum = vpaddq_s32(ev, od);                   // [r0, r1, r2, r3]
+                    sum = vsubq_s32(vshlq_n_s32(sum, 1), vdupq_n_s32(asum[sb]));
+                    accb = vfmaq_n_f32(accb, vcvtq_f32_s32(sum), ad[sb]);
+                }
+                acc = vfmaq_f32(acc, accb, b_d);
+            }
+            vst1q_f32(s, acc);
+            s += 4;
+        }
     }
     return;
 #endif
@@ -5624,6 +5703,54 @@ void ggml_gemm_q1_0_4x4_q8_0(int                        n,
                 sumf[3] = vfmaq_f32(sumf[3], blockf_3, b_d);
             }
 
+            for (int m = 0; m < 4; m++) {
+                vst1q_f32(s + (y * 4 + m) * bs + x * 4, sumf[m]);
+            }
+        }
+    }
+    return;
+#elif defined(__aarch64__) && defined(__ARM_NEON)
+    // No dot product: signs from the table as above, each activation row's 4 values of
+    // a tile duplicated across the 4 columns and multiplied into 16-bit lanes.
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (4 * y * nb);
+        for (int x = 0; x < nc / 4; x++) {
+            const block_q1_0x4 * b_ptr = (const block_q1_0x4 *) vx + (x * nb);
+            float32x4_t sumf[4] = { vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0) };
+
+            for (int l = 0; l < nb; l++) {
+                const float32x4_t b_d = vcvt_f32_f16(vld1_f16((const float16_t *) b_ptr[l].d));
+                float32x4_t blk[4] = { vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0) };
+
+                for (int k = 0; k < 4; ++k) {
+                    const block_q8_0x4 * GGML_RESTRICT a_blk = a_ptr + 4 * l + k;
+                    const float32x4_t a_d = vcvt_f32_f16(vld1_f16((const float16_t *) a_blk->d));
+                    int16x8_t lo[4], hi[4];
+                    for (int m = 0; m < 4; m++) { lo[m] = vdupq_n_s16(0); hi[m] = vdupq_n_s16(0); }
+
+                    for (int tile = 0; tile < 8; ++tile) {
+                        const int8x16_t w = ggml_q1_0_unpack_pair(b_ptr[l].qs[k * 16 + 2 * tile + 0],
+                                                                  b_ptr[l].qs[k * 16 + 2 * tile + 1]);
+                        const int32x4_t a32 = vreinterpretq_s32_s8(vld1q_s8(a_blk->qs + tile * 16));
+                        const int8x16_t a0 = vreinterpretq_s8_s32(vdupq_laneq_s32(a32, 0));
+                        const int8x16_t a1 = vreinterpretq_s8_s32(vdupq_laneq_s32(a32, 1));
+                        const int8x16_t a2 = vreinterpretq_s8_s32(vdupq_laneq_s32(a32, 2));
+                        const int8x16_t a3 = vreinterpretq_s8_s32(vdupq_laneq_s32(a32, 3));
+                        lo[0] = vmlal_s8(lo[0], vget_low_s8(w), vget_low_s8(a0)); hi[0] = vmlal_high_s8(hi[0], w, a0);
+                        lo[1] = vmlal_s8(lo[1], vget_low_s8(w), vget_low_s8(a1)); hi[1] = vmlal_high_s8(hi[1], w, a1);
+                        lo[2] = vmlal_s8(lo[2], vget_low_s8(w), vget_low_s8(a2)); hi[2] = vmlal_high_s8(hi[2], w, a2);
+                        lo[3] = vmlal_s8(lo[3], vget_low_s8(w), vget_low_s8(a3)); hi[3] = vmlal_high_s8(hi[3], w, a3);
+                    }
+                    // lo: [col0 x4, col1 x4], hi: [col2 x4, col3 x4] -> [c0, c1, c2, c3]
+                    blk[0] = vfmaq_laneq_f32(blk[0], vcvtq_f32_s32(vpaddq_s32(vpaddlq_s16(lo[0]), vpaddlq_s16(hi[0]))), a_d, 0);
+                    blk[1] = vfmaq_laneq_f32(blk[1], vcvtq_f32_s32(vpaddq_s32(vpaddlq_s16(lo[1]), vpaddlq_s16(hi[1]))), a_d, 1);
+                    blk[2] = vfmaq_laneq_f32(blk[2], vcvtq_f32_s32(vpaddq_s32(vpaddlq_s16(lo[2]), vpaddlq_s16(hi[2]))), a_d, 2);
+                    blk[3] = vfmaq_laneq_f32(blk[3], vcvtq_f32_s32(vpaddq_s32(vpaddlq_s16(lo[3]), vpaddlq_s16(hi[3]))), a_d, 3);
+                }
+                for (int m = 0; m < 4; m++) {
+                    sumf[m] = vfmaq_f32(sumf[m], blk[m], b_d);
+                }
+            }
             for (int m = 0; m < 4; m++) {
                 vst1q_f32(s + (y * 4 + m) * bs + x * 4, sumf[m]);
             }
