@@ -645,6 +645,61 @@ void ggml_vec_dot_pq2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
     *s = sumf;
 }
 
+// Ternary Bonsai (Q2_0, group 64): the PQ2_0 kernel above at two q8_0 sub-blocks per
+// weight block. Was the scalar loop on x86 - one weight at a time, 18 tok/s generation
+// and 27 tok/s prompt on a 16-core desktop where 1-bit Bonsai does 83 and 410.
+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const __m256i shifts  = _mm256_setr_epi64x(0, 2, 4, 6);
+    const __m256i mask3   = _mm256_set1_epi8(3);
+    const __m256i ones_8  = _mm256_set1_epi8(1);
+#if !defined(GGML_DPBUSD_256)
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+#endif
+    const __m256i qy_shuf = _mm256_setr_epi8(0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15,
+                                             0,4,8,12, 1,5,9,13, 2,6,10,14, 3,7,11,15);
+    const __m256i qy_perm = _mm256_setr_epi32(0,4,1,5,2,6,3,7);
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        __m256 acc_block = _mm256_setzero_ps();
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
+            const __m256i qy  = _mm256_loadu_si256((const __m256i *) yb->qs);
+            const __m256i qyp = _mm256_permutevar8x32_epi32(_mm256_shuffle_epi8(qy, qy_shuf), qy_perm);
+            int64_t xq; memcpy(&xq, &x[i].qs[k * 8], sizeof(xq));
+            const __m256i codes = _mm256_and_si256(_mm256_srlv_epi64(_mm256_set1_epi64x(xq), shifts), mask3);
+            // sum((c-1)*qy) = sum(c*qy) - sum(qy)
+#if defined(GGML_DPBUSD_256)
+            const __m256i s32 = _mm256_sub_epi32(GGML_DPBUSD_256(_mm256_setzero_si256(), codes,  qyp),
+                                                 GGML_DPBUSD_256(_mm256_setzero_si256(), ones_8, qyp));
+#else
+            const __m256i s32 = _mm256_sub_epi32(_mm256_madd_epi16(_mm256_maddubs_epi16(codes,  qyp), ones_16),
+                                                 _mm256_madd_epi16(_mm256_maddubs_epi16(ones_8, qyp), ones_16));
+#endif
+            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(yb->d)), _mm256_cvtepi32_ps(s32), acc_block);
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d0), acc_block, acc);
+    }
+    *s = hsum_float_8(acc);
+#else
+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK1_0;
     const int nb = n / qk;
