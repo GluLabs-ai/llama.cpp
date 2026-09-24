@@ -1866,6 +1866,36 @@ static inline void ggml_q2_0x4_unpack4(const uint8_t * GGML_RESTRICT qs, int8x16
 }
 #endif
 
+// Rows past the last full 4-row group are plain Q2_0 rows (repack_q2_0_to_q2_0_4_bl).
+static inline void ggml_q2_0_4x4_tail_gemv(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
+                                           const void * GGML_RESTRICT vy, int nfull, int nc) {
+    const size_t row = (size_t) (n / QK2_0) * sizeof(block_q2_0);
+    for (int r = nfull; r < nc; r++) {
+        ggml_vec_dot_q2_0_q8_0(n, s + r, 0, (const char *) vx + (size_t) r * row, 0, vy, 0, 1);
+    }
+}
+
+static inline void ggml_q2_0_4x4_tail_gemm(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx,
+                                           const void * GGML_RESTRICT vy, int nr, int nfull, int nc) {
+    if (nfull == nc) {
+        return;
+    }
+    const int    nsub = n / QK8_0;
+    block_q8_0 * row  = (block_q8_0 *) alloca((size_t) nsub * sizeof(block_q8_0));
+    for (int y = 0; y < nr / 4; y++) {
+        const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (size_t) y * nsub;
+        for (int m = 0; m < 4; m++) {
+            for (int b = 0; b < nsub; b++) {
+                row[b].d = a_ptr[b].d[m];
+                for (int j = 0; j < QK8_0; j++) {
+                    row[b].qs[j] = a_ptr[b].qs[(j / 4) * 16 + m * 4 + (j % 4)];
+                }
+            }
+            ggml_q2_0_4x4_tail_gemv(n, s + (y * 4 + m) * bs, vx, row, nfull, nc);
+        }
+    }
+}
+
 void ggml_gemv_q2_0_4x4_q8_0(int                        n,
                              float * GGML_RESTRICT      s,
                              size_t                     bs,
@@ -1877,11 +1907,11 @@ void ggml_gemv_q2_0_4x4_q8_0(int                        n,
     const int nb = n / qk;
 
     assert(n % qk == 0);
-    assert(nc % 4 == 0);
+    const int nfull = nc - nc % 4;  // plain tail rows past the last 4-row group
     UNUSED(nb);
 
 #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    for (int c = 0; c < nc; c += 4) {
+    for (int c = 0; c < nfull; c += 4) {
         const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (c / 4) * nb;
         const block_q8_0 *   a_ptr = (const block_q8_0 *) vy;
         float32x4_t acc = vdupq_n_f32(0);
@@ -1909,6 +1939,7 @@ void ggml_gemv_q2_0_4x4_q8_0(int                        n,
         vst1q_f32(s, acc);
         s += 4;
     }
+        ggml_q2_0_4x4_tail_gemv(n, s - nfull, vx, vy, nfull, nc);
     return;
 #elif defined(__aarch64__) && defined(__ARM_NEON)
     // No dot product (e.g. Snapdragon 845). Byte 4t+r of a 16-byte chunk is row r's
@@ -1944,7 +1975,7 @@ void ggml_gemv_q2_0_4x4_q8_0(int                        n,
         }
         const uint8x16_t m3 = vdupq_n_u8(3);
 
-        for (int c = 0; c < nc; c += 4) {
+        for (int c = 0; c < nfull; c += 4) {
             const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (c / 4) * nb;
             float32x4_t acc = vdupq_n_f32(0);
 
@@ -1984,6 +2015,7 @@ void ggml_gemv_q2_0_4x4_q8_0(int                        n,
             s += 4;
         }
     }
+        ggml_q2_0_4x4_tail_gemv(n, s - nfull, vx, vy, nfull, nc);
     return;
 #endif
     ggml_gemv_q2_0_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);
@@ -2001,13 +2033,13 @@ void ggml_gemm_q2_0_4x4_q8_0(int                        n,
 
     assert(n % qk == 0);
     assert(nr % 4 == 0);
-    assert(nc % 4 == 0);
+    const int nfull = nc - nc % 4;  // plain tail rows past the last 4-row group
     UNUSED(nb);
 
 #if defined(__aarch64__) && defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     for (int y = 0; y < nr / 4; y++) {
         const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb * 2);
-        for (int x = 0; x < nc / 4; x++) {
+        for (int x = 0; x < nfull / 4; x++) {
             const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (x * nb);
             float32x4_t sumf[4] = { vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0) };
 
@@ -2045,12 +2077,13 @@ void ggml_gemm_q2_0_4x4_q8_0(int                        n,
             }
         }
     }
+    ggml_q2_0_4x4_tail_gemm(n, s, bs, vx, vy, nr, nfull, nc);
     return;
 #elif defined(__aarch64__) && defined(__ARM_NEON)
     // No dot product: as the GEMV above, for 4 activation rows at once.
     for (int y = 0; y < nr / 4; y++) {
         const block_q8_0x4 * a_ptr = (const block_q8_0x4 *) vy + (y * nb * 2);
-        for (int x = 0; x < nc / 4; x++) {
+        for (int x = 0; x < nfull / 4; x++) {
             const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (x * nb);
             float32x4_t sumf[4] = { vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0), vdupq_n_f32(0) };
 
@@ -2093,6 +2126,7 @@ void ggml_gemm_q2_0_4x4_q8_0(int                        n,
             }
         }
     }
+    ggml_q2_0_4x4_tail_gemm(n, s, bs, vx, vy, nr, nfull, nc);
     return;
 #endif
     ggml_gemm_q2_0_4x4_q8_0_generic(n, s, bs, vx, vy, nr, nc);

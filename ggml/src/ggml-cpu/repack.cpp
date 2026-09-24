@@ -4328,11 +4328,9 @@ static int repack_q2_0_to_q2_0_4_bl(struct ggml_tensor *       t,
 
     GGML_ASSERT(data_size == (size_t) nrow * nblocks * sizeof(block_q2_0));
 
-    if (t->ne[1] % nrows_interleaved != 0) {
-        return -1;
-    }
-
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    // rows past the last full group of 4 stay plain at the end (as for Q1_0 16x1)
+    const int nfull = nrow - nrow % nrows_interleaved;
+    for (int b = 0; b < nfull; b += nrows_interleaved) {
         for (int64_t x = 0; x < nblocks; x++) {
             block_q2_0x4 out;
             for (int r = 0; r < 4; r++) {
@@ -4346,6 +4344,7 @@ static int repack_q2_0_to_q2_0_4_bl(struct ggml_tensor *       t,
         }
         src += nrows_interleaved * nblocks;
     }
+    memcpy((void *) dst, src, (size_t) (nrow - nfull) * nblocks * sizeof(block_q2_0));
     return 0;
 }
 
@@ -5723,9 +5722,7 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
         // Ternary Bonsai: 4 rows per unpack on NEON (arch/arm/repack.cpp), with the
         // dot product where the CPU has it and vmlal_s8 where it does not.
         if (ggml_cpu_has_neon()) {
-            if (cur->ne[1] % 4 == 0) {
-                return &q2_0_4x4_q8_0;
-            }
+            return &q2_0_4x4_q8_0;  // any row count: the tail rows stay plain
         }
     } else if (cur->type == GGML_TYPE_PQ2_0) {
         if (ggml_cpu_has_avx512() && ggml_cpu_has_avx512_vnni()) {
