@@ -1,3 +1,4 @@
+#include <alloca.h>
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -1909,47 +1910,78 @@ void ggml_gemv_q2_0_4x4_q8_0(int                        n,
     }
     return;
 #elif defined(__aarch64__) && defined(__ARM_NEON)
-    // No dot product (e.g. Snapdragon 845): a tile's 4 activations are duplicated
-    // across the 4 rows and multiplied into 16-bit lanes with vmlal_s8, so the
-    // 2-bit unpacking is still paid once per 4 rows. A 32-weight sub-block adds at
-    // most 8 products of |w| <= 1, |a| <= 127 per lane, far inside int16.
-    for (int c = 0; c < nc; c += 4) {
-        const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (c / 4) * nb;
-        const block_q8_0 *   a_ptr = (const block_q8_0 *) vy;
-        float32x4_t acc = vdupq_n_f32(0);
-
-        for (int l = 0; l < nb; l++) {
-            const float32x4_t b_d  = vcvt_f32_f16(vld1_f16((const float16_t *) b_ptr[l].d));
-            float32x4_t       accb = vdupq_n_f32(0);
-
-            for (int k = 0; k < 2; k++) {
-                const block_q8_0 * GGML_RESTRICT a_blk = a_ptr + l * 2 + k;
-                int16x8_t lo = vdupq_n_s16(0);  // rows 0,1 x 4 weight positions
-                int16x8_t hi = vdupq_n_s16(0);  // rows 2,3
-                for (int g = 0; g < 2; g++) {
-                    int8x16_t w[4];
-                    ggml_q2_0x4_unpack4(b_ptr[l].qs + (k * 2 + g) * 16, w);
-                    const int32x4_t a32 = vreinterpretq_s32_s8(vld1q_s8(a_blk->qs + g * 16));
-                    for (int t = 0; t < 4; t++) {
-                        int8x16_t a4;
-                        switch (t) {
-                            case 0:  a4 = vreinterpretq_s8_s32(vdupq_laneq_s32(a32, 0)); break;
-                            case 1:  a4 = vreinterpretq_s8_s32(vdupq_laneq_s32(a32, 1)); break;
-                            case 2:  a4 = vreinterpretq_s8_s32(vdupq_laneq_s32(a32, 2)); break;
-                            default: a4 = vreinterpretq_s8_s32(vdupq_laneq_s32(a32, 3)); break;
-                        }
-                        lo = vmlal_s8(lo, vget_low_s8(w[t]), vget_low_s8(a4));
-                        hi = vmlal_high_s8(hi, w[t], a4);
-                    }
+    // No dot product (e.g. Snapdragon 845). Byte 4t+r of a 16-byte chunk is row r's
+    // tile t and holds that tile's 4 codes at bits 2p, so a constant shift and a mask
+    // give the codes of position p for 4 tiles x 4 rows at once: 2 instructions per
+    // 16 weights, no table. The code is w+1 (0/1/2), so the dot is sum(code*a) - sum(a),
+    // and sum(a) over a 32-value block is the same for all 4 rows. The activations are
+    // permuted once per call into the lane order the codes come in - A[p] holds
+    // a[4t+p] repeated for the 4 rows of each tile - and every column group reuses them.
+    {
+        const int nsub = n / QK8_0;                 // 32-value activation blocks
+        int8_t *  perm = (int8_t *) alloca((size_t) n * 4);
+        int32_t * asum = (int32_t *) alloca((size_t) nsub * sizeof(int32_t));
+        float *   ad   = (float *) alloca((size_t) nsub * sizeof(float));
+        const block_q8_0 * a_ptr = (const block_q8_0 *) vy;
+        static const uint8_t pidx[4][16] = {
+            { 0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12 },
+            { 1, 1, 1, 1, 5, 5, 5, 5, 9, 9, 9, 9, 13, 13, 13, 13 },
+            { 2, 2, 2, 2, 6, 6, 6, 6, 10, 10, 10, 10, 14, 14, 14, 14 },
+            { 3, 3, 3, 3, 7, 7, 7, 7, 11, 11, 11, 11, 15, 15, 15, 15 },
+        };
+        for (int b = 0; b < nsub; b++) {
+            ad[b] = GGML_CPU_FP16_TO_FP32(a_ptr[b].d);
+            int32_t sum = 0;
+            for (int h = 0; h < 2; h++) {
+                const int8x16_t a16 = vld1q_s8(a_ptr[b].qs + h * 16);
+                sum += vaddlvq_s8(a16);
+                for (int q = 0; q < 4; q++) {
+                    vst1q_s8(perm + ((size_t) (b * 2 + h) * 4 + q) * 16, vqtbl1q_s8(a16, vld1q_u8(pidx[q])));
                 }
-                // [r0,r0,r1,r1] and [r2,r2,r3,r3] -> [r0,r1,r2,r3]
-                const int32x4_t sum = vpaddq_s32(vpaddlq_s16(lo), vpaddlq_s16(hi));
-                accb = vfmaq_n_f32(accb, vcvtq_f32_s32(sum), GGML_CPU_FP16_TO_FP32(a_blk->d));
             }
-            acc = vfmaq_f32(acc, accb, b_d);
+            asum[b] = sum;
         }
-        vst1q_f32(s, acc);
-        s += 4;
+        const uint8x16_t m3 = vdupq_n_u8(3);
+
+        for (int c = 0; c < nc; c += 4) {
+            const block_q2_0x4 * b_ptr = (const block_q2_0x4 *) vx + (c / 4) * nb;
+            float32x4_t acc = vdupq_n_f32(0);
+
+            for (int l = 0; l < nb; l++) {
+                const float32x4_t b_d  = vcvt_f32_f16(vld1_f16((const float16_t *) b_ptr[l].d));
+                float32x4_t       accb = vdupq_n_f32(0);
+
+                for (int k = 0; k < 2; k++) {
+                    const int sb = l * 2 + k;
+                    int16x8_t lo = vdupq_n_s16(0);  // tiles 0-1 of each chunk x rows 0-3
+                    int16x8_t hi = vdupq_n_s16(0);  // tiles 2-3
+                    for (int g = 0; g < 2; g++) {
+                        const uint8x16_t v  = vld1q_u8(b_ptr[l].qs + (k * 2 + g) * 16);
+                        const int8_t *   pa = perm + (size_t) (sb * 2 + g) * 64;
+                        const int8x16_t c0 = vreinterpretq_s8_u8(vandq_u8(v, m3));
+                        const int8x16_t c1 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 2), m3));
+                        const int8x16_t c2 = vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8(v, 4), m3));
+                        const int8x16_t c3 = vreinterpretq_s8_u8(vshrq_n_u8(v, 6));
+                        const int8x16_t a0 = vld1q_s8(pa + 0);
+                        const int8x16_t a1 = vld1q_s8(pa + 16);
+                        const int8x16_t a2 = vld1q_s8(pa + 32);
+                        const int8x16_t a3 = vld1q_s8(pa + 48);
+                        lo = vmlal_s8(lo, vget_low_s8(c0), vget_low_s8(a0)); hi = vmlal_high_s8(hi, c0, a0);
+                        lo = vmlal_s8(lo, vget_low_s8(c1), vget_low_s8(a1)); hi = vmlal_high_s8(hi, c1, a1);
+                        lo = vmlal_s8(lo, vget_low_s8(c2), vget_low_s8(a2)); hi = vmlal_high_s8(hi, c2, a2);
+                        lo = vmlal_s8(lo, vget_low_s8(c3), vget_low_s8(a3)); hi = vmlal_high_s8(hi, c3, a3);
+                    }
+                    // lanes: [t0 r0..r3, t1 r0..r3] and [t2 .., t3 ..] -> per row
+                    int32x4_t sum = vaddq_s32(vaddl_s16(vget_low_s16(lo), vget_high_s16(lo)),
+                                              vaddl_s16(vget_low_s16(hi), vget_high_s16(hi)));
+                    sum = vsubq_s32(sum, vdupq_n_s32(asum[sb]));
+                    accb = vfmaq_n_f32(accb, vcvtq_f32_s32(sum), ad[sb]);
+                }
+                acc = vfmaq_f32(acc, accb, b_d);
+            }
+            vst1q_f32(s, acc);
+            s += 4;
+        }
     }
     return;
 #endif
