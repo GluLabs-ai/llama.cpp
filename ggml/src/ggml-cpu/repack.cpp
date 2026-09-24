@@ -5590,8 +5590,9 @@ static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(cons
             }
         }
     } else if (cur->type == GGML_TYPE_Q2_0) {
-        // Ternary Bonsai: 4 rows per unpack on dot-product NEON (arch/arm/repack.cpp).
-        if (ggml_cpu_has_neon() && ggml_cpu_has_dotprod()) {
+        // Ternary Bonsai: 4 rows per unpack on NEON (arch/arm/repack.cpp), with the
+        // dot product where the CPU has it and vmlal_s8 where it does not.
+        if (ggml_cpu_has_neon()) {
             if (cur->ne[1] % 4 == 0) {
                 return &q2_0_4x4_q8_0;
             }
